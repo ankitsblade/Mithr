@@ -1,0 +1,11 @@
+
+The Solar System is the gravitationally bound system of the Sun and the objects that orbit it.
+It formed 4.6 billion years from the gravitational collapse of a giant interstellar molecular cloud.
+The vast majority (99.86%) of the system's mass is in the Sun, with most of the remaining mass
+contained in the planet Jupiter. The four inner terrestrial planets are Mercury, Venus, Earth, and Mars.
+They are composed primarily of rock and metal. The four outer giant planets are Jupiter, Saturn,
+Uranus, and Neptune. They are substantially more massive than the terrestrials. Jupiter and Saturn
+are gas giants, being composed mainly of hydrogen and helium; the two outermost planets,
+Uranus and Neptune, are ice giants, being composed mostly of substances with relatively high
+melting points compared with hydrogen and helium, called volatiles, such as water, ammonia, and methane.
+All eight planets have nearly circular orbits that lie within a nearly flat disc called the ecliptic.
