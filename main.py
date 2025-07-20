@@ -10,7 +10,7 @@ from langgraph.graph import StateGraph, END
 
 # --- 1. Import Shared Components ---
 print("Importing shared components...")
-from ingest_data import (
+from shared_components import (
     llm,
     neo4j_graph,
     vector_store,

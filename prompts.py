@@ -3,32 +3,71 @@
 
 # Prompt for the data ingestion phase to extract a detailed knowledge graph from the university website text.
 GRAPH_EXTRACTION_PROMPT = """
-You are an expert data architect specializing in academic institutions. Your task is to extract entities and their relationships from the provided text from the Mahindra University website.
-Create a detailed and robust knowledge graph.
+    You are a meticulous and highly specialized data architect. Your sole purpose is to construct a detailed, accurate, and richly interconnected knowledge graph from text scraped from the Mahindra University website. You must be extremely precise in identifying entities, extracting all their properties, and defining the relationships between them.
 
-**Instructions:**
-1.  **Identify Key Entities:** Find entities like `Professor`, `Dean`, `Department`, `School`, `Course`, `AdmissionCriterion`, `Facility`, and `Concept`.
-2.  **Extract Specific Properties:** For each entity, extract every specific detail mentioned as a property. This is crucial. Pay close attention to:
-    * **Numerical values:** Admission percentages, dates, fees, years (e.g., `passing_percentage: 75`, `established_year: 2014`).
-    * **Categorical information:** Course codes, department names, professor titles (e.g., `course_code: 'CS101'`, `title: 'Head of Department'`).
-    * **Names and Titles:** Full names of people and official names of departments or schools.
-3.  **Define Relationships:** Identify how entities are connected. Use clear, specific relationship types like `HEADS_DEPARTMENT`, `TEACHES_COURSE`, `IS_PART_OF_SCHOOL`, `REQUIRES_CRITERION`.
+    **Core Principles**
+    1.  Be Specific: Do not generalize. If the text mentions "75% required for admission," the property should be `required_percentage: 75`, not just a generic description.
+    2.  Create Atomic Entities: Each distinct person, course, department, policy, or concept should be its own node.
+    3.  Infer and Standardize: Standardize entity IDs (e.g., use "Computer Science and Engineering" as the ID for all mentions of "CSE Dept," "Computer Science," etc.). Create relationships even if they are implied (e.g., if a professor is listed on a department page, they `BELONGS_TO` that department).
 
-**Example:**
-From the text "Dr. Arya Kumar, Dean of the School of Engineering, announced the new course CS50...", you should extract:
-- A `Professor` node: `{{'id': 'Dr. Arya Kumar', 'type': 'Professor', 'properties': {{'title': 'Dean'}}}}`
-- A `School` node: `{{'id': 'School of Engineering', 'type': 'School'}}`
-- A `Course` node: `{{'id': 'CS50', 'type': 'Course'}}`
-- A relationship: `Dr. Arya Kumar` -> `IS_DEAN_OF` -> `School of Engineering`
-- A relationship: `School of Engineering` -> `OFFERS_COURSE` -> `CS50`
+    **1. Entity Types to Extract**
+    You must identify and create nodes for the following entity types:
+    * `Professor`: Any academic staff member.
+    * `School`: A major academic division (e.g., "School of Engineering," "School of Management").
+    * `Department`: A department within a School (e.g., "Computer Science and Engineering," "Mechanical Engineering").
+    * `Course`: A specific academic course.
+    * `Program`: An academic degree program (e.g., "B.Tech in AI," "MBA").
+    * `AdmissionCriterion`: A specific requirement for admission into a program.
+    * `ResearchCenter`: A named center or lab for research.
+    * `Facility`: A physical or digital resource on campus (e.g., "Library," "Hostel," "Sports Complex").
+    * `Event`: A named event, workshop, or conference.
+    * `Policy`: A specific university rule or policy (e.g., "Anti-Ragging Policy," "Scholarship Policy").
 
-Ensure the output is a valid JSON that conforms to the provided schema.
+    **2. Relationship Types to Define**
+    You must define the connections between entities using these specific relationship types:
+    * `IS_DEAN_OF`: `Professor` -> `School`
+    * `IS_HOD_OF`: `Professor` -> `Department`
+    * `WORKS_IN`: `Professor` -> `Department`
+    * `TEACHES`: `Professor` -> `Course`
+    * `PART_OF`: `Department` -> `School`
+    * `OFFERS`: `Department` or `School` -> `Program`
+    * `INCLUDES_COURSE`: `Program` -> `Course`
+    * `HAS_CRITERION`: `Program` -> `AdmissionCriterion`
+    * `HEADS_CENTER`: `Professor` -> `ResearchCenter`
+    * `HOSTS_EVENT`: `Department` or `School` -> `Event`
 
-Text to process:
----
-{text_chunk}
----
-"""
+    **3. Detailed Examples**
+    **Example 1: Faculty and Departments**
+    * Text: "The Department of Computer Science and Engineering, part of the School of Engineering, is headed by Dr. Jane Doe. She teaches CS101: Introduction to AI."
+    * Extraction:
+        * Nodes:
+            * `{{'id': 'Dr. Jane Doe', 'type': 'Professor', 'properties': {{'title': 'Head of Department'}}}}`
+            * `{{'id': 'Computer Science and Engineering', 'type': 'Department'}}`
+            * `{{'id': 'School of Engineering', 'type': 'School'}}`
+            * `{{'id': 'CS101', 'type': 'Course', 'properties': {{'name': 'Introduction to AI'}}}}`
+        * Relationships:
+            * `Dr. Jane Doe` -> `IS_HOD_OF` -> `Computer Science and Engineering`
+            * `Dr. Jane Doe` -> `TEACHES` -> `CS101`
+            * `Computer Science and Engineering` -> `PART_OF` -> `School of Engineering`
+
+    **Example 2: Admissions**
+    * Text: "Admission to the B.Tech in AI program requires a valid JEE Mains score and a minimum of 80% in Physics, Chemistry, and Maths."
+    * Extraction:
+        * Nodes:
+            * `{{'id': 'B.Tech in AI', 'type': 'Program'}}`
+            * `{{'id': 'JEE Mains Requirement', 'type': 'AdmissionCriterion', 'properties': {{'test_required': 'JEE Mains'}}}}`
+            * `{{'id': 'Academic Percentage Requirement', 'type': 'AdmissionCriterion', 'properties': {{'description': 'Minimum 80% in PCM', 'minimum_percentage': 80}}}}`
+        * Relationships:
+            * `B.Tech in AI` -> `HAS_CRITERION` -> `JEE Mains Requirement`
+            * `B.Tech in AI` -> `HAS_CRITERION` -> `Academic Percentage Requirement`
+
+    Now, process the following text chunk according to these detailed instructions.
+
+    Text to process:
+    ---
+    {text_chunk}
+    ---
+    """
 
 # Prompt for the graph search tool to generate a Cypher query.
 CYPHER_GENERATION_PROMPT = """
