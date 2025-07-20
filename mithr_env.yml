@@ -1,0 +1,24 @@
+# Conda environment configuration for the Agentic RAG project.
+# To create the environment, run: conda env create -f environment.yaml
+# To activate the environment, run: conda activate agentic-rag-env
+
+name: agentic-rag-env
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  - pip:
+    - langchain
+    - langgraph
+    - langchain-openai
+    - langchain-community
+    - pydantic
+    - python-dotenv
+    - neo4j
+    - supabase
+    - langchain_neo4j
