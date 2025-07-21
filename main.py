@@ -7,11 +7,12 @@ from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, END
+from langchain_openai import AzureChatOpenAI
 
 # --- 1. Import Shared Components ---
 print("Importing shared components...")
 from shared_components import (
-    llm,
+    llm, # Standard model
     neo4j_graph,
     vector_store,
     supabase
@@ -19,6 +20,7 @@ from shared_components import (
 from prompts import (
     CYPHER_GENERATION_PROMPT,
     ROUTING_PROMPT,
+    VALIDATE_GRAPH_RESPONSE_PROMPT,
     RESPONSE_GENERATION_PROMPT
 )
 print("Shared components imported successfully.")
@@ -29,6 +31,20 @@ load_dotenv()
 SESSION_ID = str(uuid.uuid4())
 print(f"New session started: {SESSION_ID}")
 
+# --- Initialize a dedicated, more powerful LLM for Cypher generation ---
+print("Initializing powerful LLM for Cypher generation...")
+try:
+    cypher_llm = AzureChatOpenAI(
+        openai_api_version=os.getenv("OPENAI_API_VERSION"),
+        azure_deployment=os.getenv("AZURE_OPENAI_CHAT_BIG_DEPLOYMENT_NAME"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        temperature=0,
+    )
+    print("Dedicated Cypher generation LLM initialized.")
+except Exception as e:
+    print(f"Warning: Could not initialize the powerful Cypher LLM. Using the standard agent LLM as a fallback. Error: {e}")
+    cypher_llm = llm
 
 # --- 3. Agent State and Tool Definition ---
 
@@ -38,7 +54,8 @@ class GraphState(BaseModel):
     context: str = ""
     user_query: str = ""
     next_node: str = ""
-    fallback_to_vector: bool = False
+    # FIX: Add a counter for Cypher regeneration attempts
+    cypher_attempts: int = 0
 
 # --- Agent Tools ---
 
@@ -48,24 +65,46 @@ def vector_search_tool(state: GraphState) -> dict:
     query = state.user_query
     docs = vector_store.similarity_search(query, k=3)
     context = "\n\n".join([doc.page_content for doc in docs])
-    return {"context": context, "fallback_to_vector": False}
+    return {"context": context}
 
 def graph_search_tool(state: GraphState) -> dict:
     """
-    Converts a natural language query to a Cypher query, parses the output,
-    and executes it. If it fails, it sets a flag to fallback to vector search.
+    Performs a preliminary vector search to gather context, then uses that context
+    to generate a more accurate Cypher query.
     """
     print("--- TOOL: Graph Search ---")
     query = state.user_query
     
-    # Use the imported prompt
-    cypher_generation_prompt = CYPHER_GENERATION_PROMPT.format(
+    # FIX: Add a preliminary vector search to provide the Cypher LLM with more context.
+    print("--- Performing preliminary vector search for Cypher context ---")
+    try:
+        docs = vector_store.similarity_search(query, k=2)
+        vector_context = "\n\n".join([doc.page_content for doc in docs])
+    except Exception as e:
+        print(f"Preliminary vector search failed: {e}")
+        vector_context = "" # Continue without vector context if it fails
+
+    regeneration_hint = ""
+    if state.cypher_attempts > 0:
+        regeneration_hint = "You have tried to answer this question before and failed. Please analyze the question again and formulate a new, different query strategy."
+
+    # Dynamically create an enhanced prompt with the added vector context
+    enhanced_cypher_prompt = f"""{CYPHER_GENERATION_PROMPT}
+
+Here is some additional context from a vector search that might help you identify the entities, properties, and relationships involved:
+---
+{vector_context}
+---
+"""
+
+    cypher_generation_prompt = enhanced_cypher_prompt.format(
         schema=neo4j_graph.schema,
-        question=query
+        question=query,
+        regeneration_hint=regeneration_hint
     )
     
     try:
-        raw_cypher_response = llm.invoke(cypher_generation_prompt).content
+        raw_cypher_response = cypher_llm.invoke(cypher_generation_prompt).content
         
         match = re.search(r"```(?:cypher)?\s*\n(.*?)\n```", raw_cypher_response, re.DOTALL)
         if match:
@@ -79,15 +118,15 @@ def graph_search_tool(state: GraphState) -> dict:
         print(f"Generated Cypher: {cypher_query}")
 
         if not cypher_query or cypher_query.startswith("//"):
-            print("No valid Cypher query generated. Triggering fallback.")
-            return {"context": "", "fallback_to_vector": True}
+            print("No valid Cypher query generated.")
+            return {"context": "[]"} 
         
         result = neo4j_graph.query(cypher_query)
         context = json.dumps(result, indent=2)
-        return {"context": context, "fallback_to_vector": False}
+        return {"context": context}
     except Exception as e:
-        print(f"Error in graph search: {e}. Triggering fallback.")
-        return {"context": "", "fallback_to_vector": True}
+        print(f"Error executing Cypher query: {e}.")
+        return {"context": "[]"}
 
 
 def direct_answer_tool(state: GraphState) -> dict:
@@ -99,40 +138,66 @@ def direct_answer_tool(state: GraphState) -> dict:
 
 def route_query(state: GraphState) -> dict:
     """
-    Analyzes the user query, decides which tool to use, and saves the decision to the state.
+    Analyzes the user query and decides which tool to use.
     """
     print("--- ROUTER: Deciding next step ---")
     query = state.user_query
-
-    # Use the imported prompt
     routing_prompt = ROUTING_PROMPT.format(query=query)
-    
     decision = llm.invoke(routing_prompt).content
     print(f"Router decision: {decision}")
     
-    if "vector_search" in decision:
-        return {"next_node": "vector_search"}
     if "graph_search" in decision:
-        return {"next_node": "graph_search"}
-    return {"next_node": "direct_answer"}
+        return {"next_node": "graph_search", "cypher_attempts": 0}
+    return {"next_node": decision}
 
 def select_next_node(state: GraphState) -> str:
     """
-    Reads the routing decision from the state and returns it for conditional branching.
+    Reads the routing decision from the state for conditional branching.
     """
     return state.next_node
 
-def check_graph_search_result(state: GraphState) -> str:
+def validate_graph_response(state: GraphState) -> dict:
     """
-    Checks if the graph search was successful or if a fallback is needed.
+    Uses an LLM to check if the data retrieved from the graph is a good answer.
     """
-    print("--- CHECKING GRAPH SEARCH RESULT ---")
-    if state.fallback_to_vector:
-        print("Decision: Fallback to vector search.")
-        return "fallback"
-    else:
-        print("Decision: Continue to generate response.")
-        return "continue"
+    print("--- VALIDATING GRAPH RESPONSE ---")
+    
+    if not state.context or state.context == "[]":
+        print("Context is empty. Deciding to regenerate or fallback.")
+        if state.cypher_attempts < 1:
+             return {"next_node": "regenerate_cypher"}
+        else:
+             return {"next_node": "fallback_to_vector"}
+
+    validation_prompt = VALIDATE_GRAPH_RESPONSE_PROMPT.format(
+        question=state.user_query,
+        context=state.context
+    )
+    decision = llm.invoke(validation_prompt).content
+    print(f"Validation decision: {decision}")
+    
+    if "regenerate_cypher" in decision:
+        if state.cypher_attempts < 1:
+             return {"next_node": "regenerate_cypher"}
+        else:
+             print("Max Cypher retries reached. Forcing fallback.")
+             return {"next_node": "fallback_to_vector"}
+
+    return {"next_node": decision}
+
+def select_validation_decision(state: GraphState) -> str:
+    """
+    Reads the validation decision from the state for conditional branching.
+    """
+    return state.next_node
+
+def increment_cypher_attempts(state: GraphState) -> dict:
+    """
+    Increments the counter for Cypher generation attempts.
+    """
+    print("--- INCREMENTING CYPHER ATTEMPTS ---")
+    attempts = state.cypher_attempts + 1
+    return {"cypher_attempts": attempts}
 
 def generate_response(state: GraphState) -> dict:
     """
@@ -141,13 +206,7 @@ def generate_response(state: GraphState) -> dict:
     print("--- GENERATING FINAL RESPONSE ---")
     query = state.user_query
     context = state.context
-
-    # Use the imported prompt
-    generation_prompt = RESPONSE_GENERATION_PROMPT.format(
-        context=context,
-        query=query
-    )
-    
+    generation_prompt = RESPONSE_GENERATION_PROMPT.format(context=context, query=query)
     response = llm.invoke(generation_prompt).content
     return {"messages": [("ai", response)]}
 
@@ -179,6 +238,8 @@ workflow.add_node("direct_answer", direct_answer_tool)
 workflow.add_node("generate_response", generate_response)
 workflow.add_node("log_conversation", log_conversation)
 workflow.add_node("route_query", route_query)
+workflow.add_node("validate_graph_response", validate_graph_response)
+workflow.add_node("increment_cypher_attempts", increment_cypher_attempts)
 
 workflow.set_entry_point("route_query")
 
@@ -192,14 +253,19 @@ workflow.add_conditional_edges(
     }
 )
 
+workflow.add_edge("graph_search", "validate_graph_response")
+
 workflow.add_conditional_edges(
-    "graph_search",
-    check_graph_search_result,
+    "validate_graph_response",
+    select_validation_decision,
     {
-        "fallback": "vector_search",
-        "continue": "generate_response",
+        "good_answer": "generate_response",
+        "regenerate_cypher": "increment_cypher_attempts",
+        "fallback_to_vector": "vector_search",
     }
 )
+
+workflow.add_edge("increment_cypher_attempts", "graph_search")
 
 workflow.add_edge("vector_search", "generate_response")
 workflow.add_edge("generate_response", "log_conversation")
@@ -219,7 +285,7 @@ if __name__ == "__main__":
         if user_input.lower() == 'exit':
             break
 
-        initial_state = {"user_query": user_input, "messages": [], "context": "", "next_node": "", "fallback_to_vector": False}
+        initial_state = {"user_query": user_input, "messages": []}
         final_state = agent_app.invoke(initial_state)
         
         ai_response = final_state['messages'][-1][1]
