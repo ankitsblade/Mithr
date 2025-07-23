@@ -1,9 +1,7 @@
 import os
 import uuid
-import re
-import json
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Set
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, END
@@ -12,15 +10,13 @@ from langchain_openai import AzureChatOpenAI
 # --- 1. Import Shared Components ---
 print("Importing shared components...")
 from shared_components import (
-    llm, # Standard model
-    neo4j_graph,
+    llm,
     vector_store,
     supabase
 )
 from prompts import (
-    CYPHER_GENERATION_PROMPT,
-    ROUTING_PROMPT,
-    VALIDATE_GRAPH_RESPONSE_PROMPT,
+    DOCUMENT_ROUTING_PROMPT,
+    VALIDATION_PROMPT,
     RESPONSE_GENERATION_PROMPT
 )
 print("Shared components imported successfully.")
@@ -31,186 +27,152 @@ load_dotenv()
 SESSION_ID = str(uuid.uuid4())
 print(f"New session started: {SESSION_ID}")
 
-# --- Initialize a dedicated, more powerful LLM for Cypher generation ---
-print("Initializing powerful LLM for Cypher generation...")
+# --- Initialize a dedicated, more powerful LLM for validation ---
+print("Initializing powerful LLM for validation...")
 try:
-    cypher_llm = AzureChatOpenAI(
+    validation_llm = AzureChatOpenAI(
         openai_api_version=os.getenv("OPENAI_API_VERSION"),
+        # Assumes you have set these in your .env file for the powerful model
         azure_deployment=os.getenv("AZURE_OPENAI_CHAT_BIG_DEPLOYMENT_NAME"),
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
         temperature=0,
     )
-    print("Dedicated Cypher generation LLM initialized.")
+    print("Dedicated validation LLM initialized.")
 except Exception as e:
-    print(f"Warning: Could not initialize the powerful Cypher LLM. Using the standard agent LLM as a fallback. Error: {e}")
-    cypher_llm = llm
+    print(f"Warning: Could not initialize the powerful validation LLM. Using the standard agent LLM as a fallback. Error: {e}")
+    # If the powerful model isn't configured, fall back to the standard one
+    validation_llm = llm
 
-# --- 3. Agent State and Tool Definition ---
 
-class GraphState(BaseModel):
-    """Defines the state of the agent's workflow."""
+# --- 3. Agent State Definition ---
+
+class DocumentAgentState(BaseModel):
+    """Defines the state for the document routing agent."""
     messages: list = []
-    context: str = ""
+    cumulative_context: str = ""
     user_query: str = ""
-    next_node: str = ""
-    # FIX: Add a counter for Cypher regeneration attempts
-    cypher_attempts: int = 0
+    selected_document: str = ""
+    searched_documents: Set[str] = Field(default_factory=set)
+    validation_decision: str = ""
+    search_iterations: int = 0
 
-# --- Agent Tools ---
+# --- 4. Agent Logic and Tools ---
 
-def vector_search_tool(state: GraphState) -> dict:
-    """Performs a vector search on the Supabase store."""
-    print("--- TOOL: Vector Search ---")
-    query = state.user_query
-    docs = vector_store.similarity_search(query, k=3)
-    context = "\n\n".join([doc.page_content for doc in docs])
-    return {"context": context}
-
-def graph_search_tool(state: GraphState) -> dict:
+def get_available_documents(searched_docs: Set[str]) -> List[str]:
     """
-    Performs a preliminary vector search to gather context, then uses that context
-    to generate a more accurate Cypher query.
+    Gets the list of available source documents, excluding those already searched.
     """
-    print("--- TOOL: Graph Search ---")
+    markdown_directory = "sitemap_crawl_results"
+    if not os.path.isdir(markdown_directory):
+        print(f"Warning: Document directory '{markdown_directory}' not found.")
+        return []
+    all_docs = {f for f in os.listdir(markdown_directory) if f.endswith('.md')}
+    return sorted(list(all_docs - searched_docs))
+
+def route_to_document(state: DocumentAgentState) -> dict:
+    """
+    Analyzes the user query and decides which document to search next.
+    """
+    print(f"\n--- ITERATION {state.search_iterations + 1} ---")
+    print("--- ROUTER: Deciding which document to search ---")
     query = state.user_query
     
-    # FIX: Add a preliminary vector search to provide the Cypher LLM with more context.
-    print("--- Performing preliminary vector search for Cypher context ---")
+    available_docs = get_available_documents(state.searched_documents)
+    if not available_docs:
+        print("ROUTER: No more documents to search.")
+        return {"selected_document": "NONE"}
+
+    doc_list_str = "\n".join([f"- `{doc}`" for doc in available_docs])
+    routing_prompt = DOCUMENT_ROUTING_PROMPT.format(query=query, documents=doc_list_str)
+    
+    # Use the standard, fast LLM for routing
+    decision = llm.invoke(routing_prompt).content.strip()
+    cleaned_decision = next((doc for doc in available_docs if doc in decision), "NONE")
+
+    print(f"Router decision: '{cleaned_decision}'")
+    
+    newly_searched = set(state.searched_documents)
+    if cleaned_decision != "NONE":
+        newly_searched.add(cleaned_decision)
+    
+    return {"selected_document": cleaned_decision, "searched_documents": newly_searched}
+
+def filtered_vector_search(state: DocumentAgentState) -> dict:
+    """
+    Performs a vector search filtered to only the document selected by the router.
+    """
+    print(f"--- TOOL: Performing filtered vector search on '{state.selected_document}' ---")
+    query = state.user_query
+    selected_doc = state.selected_document
+
+    if selected_doc == "NONE":
+        print("Router did not select a document. Skipping search.")
+        return {"cumulative_context": state.cumulative_context}
+
     try:
-        docs = vector_store.similarity_search(query, k=2)
-        vector_context = "\n\n".join([doc.page_content for doc in docs])
-    except Exception as e:
-        print(f"Preliminary vector search failed: {e}")
-        vector_context = "" # Continue without vector context if it fails
-
-    regeneration_hint = ""
-    if state.cypher_attempts > 0:
-        regeneration_hint = "You have tried to answer this question before and failed. Please analyze the question again and formulate a new, different query strategy."
-
-    # Dynamically create an enhanced prompt with the added vector context
-    enhanced_cypher_prompt = f"""{CYPHER_GENERATION_PROMPT}
-
-Here is some additional context from a vector search that might help you identify the entities, properties, and relationships involved:
----
-{vector_context}
----
-"""
-
-    cypher_generation_prompt = enhanced_cypher_prompt.format(
-        schema=neo4j_graph.schema,
-        question=query,
-        regeneration_hint=regeneration_hint
-    )
-    
-    try:
-        raw_cypher_response = cypher_llm.invoke(cypher_generation_prompt).content
+        docs = vector_store.similarity_search(
+            query,
+            k=4,
+            filter={'source_file': selected_doc}
+        )
+        new_context = "\n\n".join([doc.page_content for doc in docs])
         
-        match = re.search(r"```(?:cypher)?\s*\n(.*?)\n```", raw_cypher_response, re.DOTALL)
-        if match:
-            cypher_query = match.group(1).strip()
-        else:
-            cypher_query = raw_cypher_response.strip()
+        updated_context = state.cumulative_context + "\n\n---\n\n" + new_context if state.cumulative_context else new_context
+        return {"cumulative_context": updated_context}
 
-        if cypher_query.startswith('"') and cypher_query.endswith('"'):
-            cypher_query = cypher_query[1:-1]
-
-        print(f"Generated Cypher: {cypher_query}")
-
-        if not cypher_query or cypher_query.startswith("//"):
-            print("No valid Cypher query generated.")
-            return {"context": "[]"} 
-        
-        result = neo4j_graph.query(cypher_query)
-        context = json.dumps(result, indent=2)
-        return {"context": context}
     except Exception as e:
-        print(f"Error executing Cypher query: {e}.")
-        return {"context": "[]"}
+        print(f"Error during filtered vector search: {e}")
+        return {"cumulative_context": state.cumulative_context}
 
-
-def direct_answer_tool(state: GraphState) -> dict:
-    """Handles conversational turns where no retrieval is needed."""
-    print("--- TOOL: Direct Answer ---")
-    return {"context": "No retrieval needed for this query."}
-
-# --- 4. Agent Logic and Graph Definition ---
-
-def route_query(state: GraphState) -> dict:
+def validate_search_result(state: DocumentAgentState) -> dict:
     """
-    Analyzes the user query and decides which tool to use.
+    Uses a powerful LLM to check if the retrieved context is a good answer and increments iteration count.
     """
-    print("--- ROUTER: Deciding next step ---")
+    print("--- VALIDATING SEARCH RESULT ---")
     query = state.user_query
-    routing_prompt = ROUTING_PROMPT.format(query=query)
-    decision = llm.invoke(routing_prompt).content
-    print(f"Router decision: {decision}")
-    
-    if "graph_search" in decision:
-        return {"next_node": "graph_search", "cypher_attempts": 0}
-    return {"next_node": decision}
+    context = state.cumulative_context
+    iterations = state.search_iterations + 1
 
-def select_next_node(state: GraphState) -> str:
-    """
-    Reads the routing decision from the state for conditional branching.
-    """
-    return state.next_node
+    remaining_docs = get_available_documents(state.searched_documents)
+    if not remaining_docs:
+        print("No more documents to search. Accepting current answer as final.")
+        return {"validation_decision": "final_answer", "search_iterations": iterations}
 
-def validate_graph_response(state: GraphState) -> dict:
-    """
-    Uses an LLM to check if the data retrieved from the graph is a good answer.
-    """
-    print("--- VALIDATING GRAPH RESPONSE ---")
-    
-    if not state.context or state.context == "[]":
-        print("Context is empty. Deciding to regenerate or fallback.")
-        if state.cypher_attempts < 1:
-             return {"next_node": "regenerate_cypher"}
-        else:
-             return {"next_node": "fallback_to_vector"}
+    MAX_ITERATIONS = 3
+    if iterations >= MAX_ITERATIONS:
+        print(f"Max search iterations ({MAX_ITERATIONS}) reached. Accepting current answer as final.")
+        return {"validation_decision": "final_answer", "search_iterations": iterations}
 
-    validation_prompt = VALIDATE_GRAPH_RESPONSE_PROMPT.format(
-        question=state.user_query,
-        context=state.context
-    )
-    decision = llm.invoke(validation_prompt).content
-    print(f"Validation decision: {decision}")
-    
-    if "regenerate_cypher" in decision:
-        if state.cypher_attempts < 1:
-             return {"next_node": "regenerate_cypher"}
-        else:
-             print("Max Cypher retries reached. Forcing fallback.")
-             return {"next_node": "fallback_to_vector"}
+    validation_prompt = VALIDATION_PROMPT.format(query=query, context=context)
+    # Use the dedicated, powerful LLM for validation
+    decision = validation_llm.invoke(validation_prompt).content.strip()
+    print(f"Validation decision: '{decision}'")
 
-    return {"next_node": decision}
+    return {"validation_decision": decision, "search_iterations": iterations}
 
-def select_validation_decision(state: GraphState) -> str:
+def decide_next_step(state: DocumentAgentState) -> str:
     """
-    Reads the validation decision from the state for conditional branching.
+    Determines the next step based on the validation result.
     """
-    return state.next_node
+    if state.validation_decision == "try_another_document":
+        return "route_to_document"
+    else:
+        return "generate_response"
 
-def increment_cypher_attempts(state: GraphState) -> dict:
-    """
-    Increments the counter for Cypher generation attempts.
-    """
-    print("--- INCREMENTING CYPHER ATTEMPTS ---")
-    attempts = state.cypher_attempts + 1
-    return {"cypher_attempts": attempts}
-
-def generate_response(state: GraphState) -> dict:
+def generate_response(state: DocumentAgentState) -> dict:
     """
     Generates the final answer to the user based on the retrieved context.
     """
     print("--- GENERATING FINAL RESPONSE ---")
     query = state.user_query
-    context = state.context
+    context = state.cumulative_context
+
     generation_prompt = RESPONSE_GENERATION_PROMPT.format(context=context, query=query)
     response = llm.invoke(generation_prompt).content
     return {"messages": [("ai", response)]}
 
-def log_conversation(state: GraphState) -> dict:
+def log_conversation(state: DocumentAgentState) -> dict:
     """Logs the user query and the final AI response to Supabase."""
     print("--- LOGGING CONVERSATION ---")
     user_query = state.user_query
@@ -230,44 +192,27 @@ def log_conversation(state: GraphState) -> dict:
 
 # --- 5. Assembling the Agentic Workflow using LangGraph ---
 
-workflow = StateGraph(GraphState)
+workflow = StateGraph(DocumentAgentState)
 
-workflow.add_node("vector_search", vector_search_tool)
-workflow.add_node("graph_search", graph_search_tool)
-workflow.add_node("direct_answer", direct_answer_tool)
+workflow.add_node("route_to_document", route_to_document)
+workflow.add_node("filtered_vector_search", filtered_vector_search)
+workflow.add_node("validate_search_result", validate_search_result)
 workflow.add_node("generate_response", generate_response)
 workflow.add_node("log_conversation", log_conversation)
-workflow.add_node("route_query", route_query)
-workflow.add_node("validate_graph_response", validate_graph_response)
-workflow.add_node("increment_cypher_attempts", increment_cypher_attempts)
 
-workflow.set_entry_point("route_query")
+workflow.set_entry_point("route_to_document")
+workflow.add_edge("route_to_document", "filtered_vector_search")
+workflow.add_edge("filtered_vector_search", "validate_search_result")
 
 workflow.add_conditional_edges(
-    "route_query",
-    select_next_node,
+    "validate_search_result",
+    decide_next_step,
     {
-        "vector_search": "vector_search",
-        "graph_search": "graph_search",
-        "direct_answer": "generate_response",
+        "route_to_document": "route_to_document",
+        "generate_response": "generate_response",
     }
 )
 
-workflow.add_edge("graph_search", "validate_graph_response")
-
-workflow.add_conditional_edges(
-    "validate_graph_response",
-    select_validation_decision,
-    {
-        "good_answer": "generate_response",
-        "regenerate_cypher": "increment_cypher_attempts",
-        "fallback_to_vector": "vector_search",
-    }
-)
-
-workflow.add_edge("increment_cypher_attempts", "graph_search")
-
-workflow.add_edge("vector_search", "generate_response")
 workflow.add_edge("generate_response", "log_conversation")
 workflow.add_edge("log_conversation", END)
 
@@ -277,7 +222,7 @@ agent_app = workflow.compile()
 # --- 6. Main Execution Block ---
 
 if __name__ == "__main__":
-    print("\n\n--- Mahindra University AI Assistant ---")
+    print("\n\n--- Mahindra University AI Assistant (Iterative RAG) ---")
     print("Ask me anything about the university. Type 'exit' to end.")
 
     while True:

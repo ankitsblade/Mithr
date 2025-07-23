@@ -1,54 +1,130 @@
+import os
 import time
-# Import the new text splitter
+import re
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Import the necessary pre-initialized client from our shared components file
 from shared_components import vector_store
 
+def clean_markdown_content(text: str) -> str:
+    """
+    Performs a more robust cleaning of the markdown text.
+    1. Removes all markdown-style links (both standard and image).
+    2. Cleans up leftover empty list items and excessive blank lines.
+    """
+    # Step 1: Remove all markdown links (e.g., [text](url) and ![alt](url))
+    text_no_links = re.sub(r'!*\[[^\]]*\]\([^\)]+\)', '', text)
+
+    # Step 2: Process lines to remove leftover artifacts
+    lines = text_no_links.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # This regex checks if a line consists ONLY of whitespace and/or markdown list markers (*, -, +)
+        # If it does, we skip it to remove the empty list item.
+        if not re.match(r'^\s*[\*\-\+]\s*$', line):
+            cleaned_lines.append(line)
+
+    # Rejoin the text and reduce multiple blank lines down to a single one
+    cleaned_text = '\n'.join(cleaned_lines)
+    cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+    
+    return cleaned_text.strip()
+
+
+def extract_title_from_markdown(content: str) -> str:
+    """
+    Extracts the first H1 header (# Title) from the markdown content.
+    Falls back to the first non-empty line if no H1 is found.
+    """
+    match = re.search(r'^#\s+(.*)', content, re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+    
+    first_line = next((line for line in content.split('\n') if line.strip()), "Untitled Document")
+    return first_line.strip()
+
 def ingest_into_supabase():
     """
-    Main function to handle data ingestion from the text file into the
-    Supabase vector store.
+    Reads all markdown files from a specified directory, cleans them, splits them into chunks,
+    extracts metadata, and ingests them into a Supabase table.
     """
-    print("Starting Supabase ingestion process...")
-    try:
-        # Note: The user provided a full path in the last request.
-        # Using a relative path is often more portable.
-        with open("final_scraped.txt", "r") as f:
-            text_content = f.read()
-        print("Successfully read corpus file.")
-    except FileNotFoundError:
-        print("ERROR: Corpus file not found. Please check the path.")
+    markdown_directory = "sitemap_crawl_results"
+    if not os.path.isdir(markdown_directory):
+        print(f"ERROR: Directory not found: '{markdown_directory}'")
+        print("Please make sure a directory named 'sitemap_crawl_results' exists and contains your .md files.")
         return
 
-    # FIX: Use RecursiveCharacterTextSplitter for more accurate, context-aware chunking.
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,
+        chunk_size=1500,
         chunk_overlap=200,
-        separators=["\n\n", "\n", ". ", " ", ""]
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len
     )
-    chunks = text_splitter.split_text(text_content)
-    print(f"Split content into {len(chunks)} chunks using RecursiveCharacterTextSplitter.")
 
+    files_to_process = [f for f in os.listdir(markdown_directory) if f.endswith('.md')]
+    print(f"Found {len(files_to_process)} markdown files to process in '{markdown_directory}'.")
 
-    # Implement batching to handle API rate limits
-    BATCH_SIZE = 16  # The number of chunks to process in each batch
-    DELAY_BETWEEN_BATCHES = 2 # Seconds to wait between batches
+    all_chunks = []
+    all_metadatas = []
 
-    print("\n--- Ingesting data into Supabase Vector Store in batches ---")
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i:i + BATCH_SIZE]
-        print(f"Processing batch {i//BATCH_SIZE + 1}/{len(chunks)//BATCH_SIZE + 1}...")
+    # --- Step 1: Read, Clean, and Chunk all files ---
+    for filename in files_to_process:
+        filepath = os.path.join(markdown_directory, filename)
         try:
-            vector_store.add_texts(batch)
-            print(f"Batch {i//BATCH_SIZE + 1} ingested. Waiting for {DELAY_BETWEEN_BATCHES} seconds...")
-            time.sleep(DELAY_BETWEEN_BATCHES)
-        except Exception as e:
-            print(f"An error occurred during batch {i//BATCH_SIZE + 1}: {e}")
-            # Optional: decide if you want to stop or continue on error
-            continue
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Use the new, more robust cleaning function
+            cleaned_content = clean_markdown_content(content)
+            
+            # Extract title from the already cleaned content
+            title = extract_title_from_markdown(cleaned_content)
+            
+            chunks = text_splitter.split_text(cleaned_content)
+            
+            for i, chunk_text in enumerate(chunks):
+                all_chunks.append(chunk_text)
+                all_metadatas.append({
+                    'source_file': filename,
+                    'title': title,
+                    'chunk_index': i
+                })
+            
+            print(f" - Cleaned and split '{filename}' (Title: '{title}') into {len(chunks)} chunks.")
 
-    print("Data ingestion into Supabase complete.")
+        except Exception as e:
+            print(f" - ERROR processing file {filename}: {e}")
+
+    if not all_chunks:
+        print("No chunks were generated from the files. Exiting.")
+        return
+        
+    print(f"\nTotal chunks to ingest: {len(all_chunks)}")
+
+    # --- Step 2: Ingest in Batches ---
+    BATCH_SIZE = 50
+    DELAY_BETWEEN_BATCHES = 2
+
+    for i in range(0, len(all_chunks), BATCH_SIZE):
+        batch_chunks = all_chunks[i:i + BATCH_SIZE]
+        batch_metadatas = all_metadatas[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        total_batches = -(-len(all_chunks) // BATCH_SIZE)
+
+        print(f"\n--- Processing Batch {batch_num}/{total_batches} ---")
+
+        try:
+            vector_store.add_texts(texts=batch_chunks, metadatas=batch_metadatas)
+            print(f"Successfully ingested Batch {batch_num} ({len(batch_chunks)} chunks).")
+
+        except Exception as e:
+            print(f"ERROR on Batch {batch_num}: {e}")
+        
+        if i + BATCH_SIZE < len(all_chunks):
+            print(f"Waiting for {DELAY_BETWEEN_BATCHES} seconds before next batch...")
+            time.sleep(DELAY_BETWEEN_BATCHES)
+
+    print("\n--- Data ingestion process complete. ---")
 
 
 if __name__ == "__main__":
